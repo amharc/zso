@@ -1,0 +1,58 @@
+Krzysztof Pszeniczny, 347208
+Drugie zadanie zaliczeniowe z ZSO, 2015/2016
+-------------------------------------------------------------------------------
+
+Na każde urządzenie mam jeden centralny bufor cykliczny na 1024 polecenia (wtedy
+rozmiar bufora to po prostu 1 strona) -- write'y piszą do niego (oczywiście pod
+ochroną muteksem) tyle, ile zdołają, przy czym są budzone dopiero, gdy jest wolnych
+przynajmniej 16 pozycji w buforze -- bo jeśli następuje właśnie zmiana kontekstu
+na urządzeniu, to być może trzeba wrzucić kilka poleceń wstępnych, typu zmiana
+płótna, zmiana wymiarów płótna, przywrócenie ustawionych src_pos, ... .
+Bufor zakończony jest JUMP-em na początek bufora. Po każdym poleceniu zapisuję
+COUNTER z NOTIFY, dzięki któremu wiem, że mam już miejsce w buforze, a także
+wiem, że mogę budzić fsynci (patrz niżej).
+
+Co do semantyki wymagania SRC_POS, DST_POS, FILL_COLOR: przyjąłem interpretację,
+że użytkownik może dowolnie często ustawiać sobie te wartości, a ja mu gwarantuję,
+że każdy jego write będzie miał przywrócony poprawnie kontekst. Oczywiście użycie
+np. DO_FILL "zjada" DST_POS i FILL_COLOR (ale już nie SRC_POS) -- próba ponownego
+użycia DO_FILL bez ustawienia ich ponownie będzie oczywiście błędem.
+
+Przyjąłem, że zapewne nie będzie jakoś bardzo dużo użytkowników konkurujących o
+jedno urządzenie, więc gdy zwolni się miejsce w buforze, to budzę wszystkie write'y
+oczekujące na wolne miejsce -- conajwyżej zasną ponownie.
+
+Oczekiwanie fsynciem zrealizowałem poprzez trzymanie dla każdego zapisu writem
+osobnej struktury opisującej ten zapis poleceń -- ma ona np. własną kolejkę oczekujących,
+zatem fsync znajduje po prostu ostatni zakolejkowany write w jego kontekscie, inkrementuje
+mu licznik referencji (żeby ktoś nie próbował teraz złośliwie zwolnić tej strukturki)
+i idzie spać na tej kolejce, aż polecenie się nie przeliczy.
+
+Powyższe rozwiązanie oczywiście gwarantuje jedynie, że fsync czeka na write'y,
+które wróciły do przestrzeni użytkownika. Jeśli użytkownik próbuje robić tak dziwne
+rzeczy, jak jednoczesne pisanie i fsyncowanie z różnych wątków, to ja nie gwarantuję
+mu, że fsync zaczeka, aż wszystkie zgłoszone do kernela write'y się zakończą --
+obsługa tego była by ciężka, gdyż np. write może być niepoprawny. Zakładam więc, że
+użytkownik nie robi takich dziwnych rzeczy. Jednakże to rozwiązanie pozwala mieć
+dla jednego kontekstu kilka różnych fsynców czekających na kilka różnych write'ów
+-- nie blokują się one w żaden sposób.
+
+Przy usuwaniu urządzenia czekam, aż wszyscy użytkownicy przestaną go używać -- dokładniej,
+aż nikt nie będzie już używał cdeva do niczego. Do poprawnego oczekiwania na to
+(żeby np. wykluczyć złośliwe przeploty z openami) wpinam się do hierarchii kobjectów
+-- podpinam cdeva jako dziecko swojego własnego kobjecta, który w czasie bycia zwalnianym
+informuje remove, że może kontynuować. W ten sposób wiem, że pozwolę dokończyć remove
+dopiero wtedy, kiedy już absolutnie nikt nic nie robi z cdevem.
+
+Gdy użytkownik ustawi wymiary płotna, to alokuję całe płotno od razu (ale oczywiście
+pojedynczymi stronami, choć mam je podpięte stale do przestrzeni adresowej jądra --
+ale jak wynika z odpowiedzi na moje pytanie na labach, jest to dopuszczalne).
+Jeżeli użytkownik prosi bądź co bądź kartę graficzną o płótno, to zapewne będzie
+zaraz po nim rysował, bo co innego ma robić i zapewne należy zakładać, że będzie
+go używał w całości (bo inaczej po co by prosił o takie duże). To rozwiązanie
+pozwala ładnie obsłużyć błędy braku pamięci -- po prostu ioctl zwróci -ENOMEM,
+zaś rozwiązanie, które alokuje strony dopiero w momencie błędu braku strony
+czy to ze strony użytkownika czy urządzenia, ma większy problem, jeśli dma_pool_alloc
+zwróci NULL -- w sumie jedyne, co jej pozostaje, to SIGKILL na wszystkich użytkownikach
+płótna...
+

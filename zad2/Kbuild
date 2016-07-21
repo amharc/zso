@@ -1,0 +1,3 @@
+obj-m := vintage2d.o
+vintage2d-objs := v2d_utils.o v2d_fileops.o v2d_validate.o v2d_main.o
+ccflags-y := 

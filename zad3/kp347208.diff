@@ -1,0 +1,1963 @@
+diff --git a/fs/ext2/Makefile b/fs/ext2/Makefile
+index 445b0e9..61156cd 100644
+--- a/fs/ext2/Makefile
++++ b/fs/ext2/Makefile
+@@ -5,7 +5,7 @@
+ obj-$(CONFIG_EXT2_FS) += ext2.o
+ 
+ ext2-y := balloc.o dir.o file.o ialloc.o inode.o \
+-	  ioctl.o namei.o super.o symlink.o
++	  ioctl.o namei.o super.o symlink.o cow.o
+ 
+ ext2-$(CONFIG_EXT2_FS_XATTR)	 += xattr.o xattr_user.o xattr_trusted.o
+ ext2-$(CONFIG_EXT2_FS_POSIX_ACL) += acl.o
+diff --git a/fs/ext2/cow.c b/fs/ext2/cow.c
+new file mode 100644
+index 0000000..9bf6663
+--- /dev/null
++++ b/fs/ext2/cow.c
+@@ -0,0 +1,319 @@
++#include "ext2.h"
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/buffer_head.h>
++
++/**
++ * Finds an existing ext2_cow_mutex associated with the provided inode root.
++ * Returns NULL if no such mutex is already present.
++ * The red black tree should be at least read-locked.
++ * The returned mutex has its refcount incremented.
++ */
++static struct ext2_cow_mutex *__ext2_find_cow_mutex(struct rb_root *rb_root, ino_t root) {
++	struct rb_node *node = rb_root->rb_node;
++
++	while(node) {
++		struct ext2_cow_mutex *data = container_of(node, struct ext2_cow_mutex, node);
++
++		if(root < data->root) {
++			node = node->rb_left;
++		}
++		else if(data->root < root) {
++			node = node->rb_right;
++		}
++		else {
++			/* Because we are under only a read_lock, the increment must be atomic */
++			atomic_inc(&data->refcount);
++			return data;
++		}
++	}
++
++	return NULL;
++}
++
++/**
++ * Inserts an existing ext2_cow_mutex in the rbtree.
++ * The red black tree should be write-locked.
++ */
++static void __ext2_insert_cow_mutex_existing(struct rb_root *rb_root, struct ext2_cow_mutex *mutex) {
++	struct rb_node **new = &rb_root->rb_node, *parent = NULL;
++	struct ext2_cow_mutex *data;
++
++	while (*new) {
++		data = container_of(*new, struct ext2_cow_mutex, node);
++
++		BUG_ON(data->root == mutex->root);
++
++		parent = *new;
++		if(mutex->root < data->root) {
++			new = &(*new)->rb_left;
++		}
++		else {
++			new = &(*new)->rb_right;
++		}
++	}
++
++	rb_link_node(&mutex->node, parent, new);
++	rb_insert_color(&mutex->node, rb_root);
++}
++
++/**
++ * Finds an existing ext2_cow_mutex associated with the provided inode root.
++ * Allocates a new node if it is not already present.
++ * The red black tree should be write-locked.
++ * The returned mutex has its refcount incremented.
++ */
++static struct ext2_cow_mutex *__ext2_insert_cow_mutex(struct rb_root *rb_root, ino_t root) {
++	struct rb_node **new = &rb_root->rb_node, *parent = NULL;
++	struct ext2_cow_mutex *data;
++
++	while (*new) {
++		data = container_of(*new, struct ext2_cow_mutex, node);
++
++		parent = *new;
++		if(root < data->root) {
++			new = &(*new)->rb_left;
++		}
++		else if(data->root < root) {
++			new = &(*new)->rb_right;
++		}
++		else {
++			atomic_inc(&data->refcount);
++			return data;
++		}
++	}
++
++	data = kmalloc(sizeof(struct ext2_cow_mutex), GFP_KERNEL);
++	if (unlikely(!data)) {
++		return NULL;
++	}
++
++	data->root = root;
++	mutex_init(&data->mutex);
++	atomic_set(&data->refcount, 1);
++
++	rb_link_node(&data->node, parent, new);
++	rb_insert_color(&data->node, rb_root);
++
++	return data;
++}
++
++/**
++ * Retrieves (or creates a new one) the cow-aware truncate_mutex associated with
++ * inode root.
++ *
++ * Returns NULL if allocation failed
++ */
++struct ext2_cow_mutex *ext2_get_cow_mutex(struct ext2_sb_info *sb, ino_t root) {
++	struct ext2_cow_mutex *mutex;
++
++	down_read(&sb->s_cow_rwsem);
++	mutex = __ext2_find_cow_mutex(&sb->s_cow_rbtree, root);
++	if (unlikely(mutex)) {
++		/* It is a cow-shared mutex and someone already has allocated it for us. */
++		up_read(&sb->s_cow_rwsem);
++		return mutex;
++	}
++	up_read(&sb->s_cow_rwsem);
++
++	/* Somebody may allocate the mutex now, when we have dropped the lock.
++	 * Therefore __ext2_insert_cow_mutex has to re-check if the value is already
++	 * present in the tree.
++	 */
++
++	down_write(&sb->s_cow_rwsem);
++	mutex = __ext2_insert_cow_mutex(&sb->s_cow_rbtree, root);
++	up_write(&sb->s_cow_rwsem);
++
++	return mutex;
++}
++
++/**
++ * Decrements the refcount of a ext2_cow_mutex and, if it drops to zero,
++ * removes it from the superblock's rbtree and deallocates.
++ */
++void ext2_put_cow_mutex(struct ext2_sb_info *sb, struct ext2_cow_mutex *mutex) {
++	down_write(&sb->s_cow_rwsem);
++	if (likely(atomic_dec_and_test(&mutex->refcount))) {
++		rb_erase(&mutex->node, &sb->s_cow_rbtree);
++
++		mutex_destroy(&mutex->mutex);
++		kfree(mutex);
++	}
++	up_write(&sb->s_cow_rwsem);
++}
++
++/**
++ * Unloads an initial segment of the inode's COW list.
++ * I.e. put all the inodes, ending the lease by ext2_cow_get_list_of.
++ * The search stops on @target.
++ *
++ * Pass @target = 0 to put the whole list.
++ */
++static inline void ext2_cow_put_list_until(struct inode *inode, ino_t target) {
++	ino_t ino = EXT2_I(inode)->i_cow_root;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++
++	while (ino != target) {
++		struct inode *cur;
++
++		if (ino == inode->i_ino) {
++			cur = inode;
++			ino = EXT2_I(cur)->i_cow_next;
++		}
++		else {
++			cur = iget_locked(inode->i_sb, ino);
++			BUG_ON(cur->i_state & I_NEW);
++			ino = EXT2_I(cur)->i_cow_next;
++			iput(cur); /* acquired by iget_locked */
++			iput(cur); /* the lease */
++		}
++	}
++}
++
++/**
++ * Unloads the cow-list of the inode provided.
++ * The truncate_mutex has to be held and cannot be released
++ * between the calls to ext2_cow_get_list_of
++ * and ext2_cow_put_list_of.
++ */
++void ext2_cow_put_list_of(struct inode *inode) {
++	ext2_cow_put_list_until(inode, 0);
++}
++
++/**
++ * Loads the cow-list of the inode provided to memory.
++ * The truncate_mutex must be held at least until the corresponding call
++ * to ext2_cow_put_list_of.
++ *
++ * Every member of the COW list, save for @inode, has its refcount incremented,
++ * so they will stay in the inode cache.
++ *
++ * Returns 0 on success, negative values on error.
++ */
++int ext2_cow_get_list_of(struct inode *inode) {
++	ino_t ino = EXT2_I(inode)->i_cow_root;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++
++	while (ino) {
++		struct inode *cur;
++
++		if (ino == inode->i_ino) {
++			cur = inode;
++		}
++		else {
++			cur = ext2_iget(inode->i_sb, ino);
++			if (IS_ERR(cur)) {
++				ext2_cow_put_list_until(inode, ino);
++				return PTR_ERR(cur);
++			}
++		}
++
++		ino = EXT2_I(cur)->i_cow_next;
++	}
++
++	return 0;
++}
++
++/**
++ * Removes an inode which is not the root of its COW list from the list.
++ *
++ * The inode must be subject to COW, i.e. its COW list
++ * must be nonempty.
++ * Requires the COW list to be held in memory.
++ */
++static void ext2_cow_remove_nonroot(struct inode *inode) {
++	ino_t ino = EXT2_I(inode)->i_cow_root;
++	struct inode *cur = NULL;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++	BUG_ON(ino == 0);
++	BUG_ON(ino == inode->i_ino);
++
++	while (ino != inode->i_ino) {
++		cur = iget_locked(inode->i_sb, ino);
++		BUG_ON(cur->i_state & I_NEW);
++		ino = EXT2_I(cur)->i_cow_next;
++
++		if (ino == inode->i_ino) {
++			EXT2_I(cur)->i_cow_next = EXT2_I(inode)->i_cow_next;
++			mark_inode_dirty(cur);
++		}
++
++		iput(cur);
++	}
++}
++
++/**
++ * Removes a root of the COW list from the list.
++ *
++ * The inode must be subject to COW, i.e. its COW list
++ * must be nonempty.
++ * Requires the COW list to be held in memory.
++ */
++static void ext2_cow_remove_root(struct inode *inode) {
++	ino_t new_root = EXT2_I(inode)->i_cow_next, ino = new_root;
++	struct ext2_sb_info *sb = EXT2_SB(inode->i_sb);
++	struct ext2_cow_mutex *mutex = EXT2_COW_MUTEX(inode);
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++	BUG_ON(EXT2_I(inode)->i_cow_root != inode->i_ino);
++	BUG_ON(new_root == 0);
++
++	EXT2_I(inode)->i_cow_root = new_root;
++	
++	while (ino != 0) {
++		struct inode *cur = iget_locked(inode->i_sb, ino);
++		BUG_ON(cur->i_state & I_NEW);
++		ino = EXT2_I(cur)->i_cow_next;
++
++		EXT2_I(cur)->i_cow_root = new_root;
++		mark_inode_dirty(cur);
++		iput(cur);
++	}
++
++	down_write(&sb->s_cow_rwsem);
++	rb_erase(&mutex->node, &sb->s_cow_rbtree);
++	mutex->root = new_root;
++	__ext2_insert_cow_mutex_existing(&sb->s_cow_rbtree, mutex);
++	up_write(&sb->s_cow_rwsem);
++}
++
++/**
++ * Removes an inode from its COW list.
++ *
++ * Returns 0 on success, negative value on error.
++ * In the latter case, the inode must not be freed
++ * or data loss may occur.
++ */
++int ext2_unlink_cow(struct inode *inode) {
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	int ret = 0;
++
++	if (!ext2_is_cowed(inode)) {
++		goto out;
++	}
++
++	mutex_lock(ei->truncate_mutex);
++	ret = ext2_cow_get_list_of(inode);
++	if (IS_ERR_VALUE(ret)) {
++		goto unlock_out;
++	}
++
++	if (ei->i_cow_root == inode->i_ino) {
++		ext2_cow_remove_root(inode);
++	}
++	else {
++		ext2_cow_remove_nonroot(inode);
++	}
++
++	ext2_cow_put_list_of(inode);
++
++unlock_out:
++	mutex_unlock(ei->truncate_mutex);
++
++out:
++	return ret;
++}
+diff --git a/fs/ext2/ext2.h b/fs/ext2/ext2.h
+index 8d15feb..1288f8e 100644
+--- a/fs/ext2/ext2.h
++++ b/fs/ext2/ext2.h
+@@ -62,6 +62,16 @@ struct ext2_block_alloc_info {
+ #define rsv_end rsv_window._rsv_end
+ 
+ /*
++ * cow-enabled truncate_mutex
++ */
++struct ext2_cow_mutex {
++	ino_t root;
++	struct rb_node node;
++	struct mutex mutex;
++	atomic_t refcount;
++};
++
++/*
+  * second extended-fs super-block data in memory
+  */
+ struct ext2_sb_info {
+@@ -111,6 +121,9 @@ struct ext2_sb_info {
+ 	 * of the mount options.
+ 	 */
+ 	spinlock_t s_lock;
++
++	struct rb_root s_cow_rbtree;
++	struct rw_semaphore s_cow_rwsem;
+ };
+ 
+ static inline spinlock_t *
+@@ -283,6 +296,11 @@ static inline __u32 ext2_mask_flags(umode_t mode, __u32 flags)
+ #define	EXT2_IOC_GETRSVSZ		_IOR('f', 5, long)
+ #define	EXT2_IOC_SETRSVSZ		_IOW('f', 6, long)
+ 
++/* This ioctl id is used by neither ext3 nor ext4, which are
++ * the only file systems ext2 shares super magic number with.
++ */
++#define	EXT2_IOC_COWDUP			_IOW('f', 25, int)
++
+ /*
+  * ioctl commands in 32 bit emulation
+  */
+@@ -350,14 +368,14 @@ struct ext2_inode {
+ 
+ #define i_size_high	i_dir_acl
+ 
+-#define i_reserved1	osd1.linux1.l_i_reserved1
++#define i_res_cow_root	osd1.linux1.l_i_reserved1
+ #define i_frag		osd2.linux2.l_i_frag
+ #define i_fsize		osd2.linux2.l_i_fsize
+ #define i_uid_low	i_uid
+ #define i_gid_low	i_gid
+ #define i_uid_high	osd2.linux2.l_i_uid_high
+ #define i_gid_high	osd2.linux2.l_i_gid_high
+-#define i_reserved2	osd2.linux2.l_i_reserved2
++#define i_res_cow_next	osd2.linux2.l_i_reserved2
+ 
+ /*
+  * File system states
+@@ -691,12 +709,14 @@ struct ext2_inode_info {
+ 	 * reservation data structures: ext2_reserve_window and
+ 	 * ext2_reserve_window_node.
+ 	 */
+-	struct mutex truncate_mutex;
++	struct mutex *truncate_mutex;
+ 	struct inode	vfs_inode;
+ 	struct list_head i_orphan;	/* unlinked but open inodes */
+ #ifdef CONFIG_QUOTA
+ 	struct dquot *i_dquot[MAXQUOTAS];
+ #endif
++	ino_t i_cow_root;
++	ino_t i_cow_next;
+ };
+ 
+ /*
+@@ -719,6 +739,23 @@ static inline struct ext2_inode_info *EXT2_I(struct inode *inode)
+ 	return container_of(inode, struct ext2_inode_info, vfs_inode);
+ }
+ 
++static inline struct ext2_cow_mutex *EXT2_COW_MUTEX(struct inode *inode) {
++	return container_of(EXT2_I(inode)->truncate_mutex, struct ext2_cow_mutex, mutex);
++}
++
++static inline int ext2_is_cowed(struct inode *inode) {
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	return ei->i_cow_root != 0 && (ei->i_cow_root != inode->i_ino || ei->i_cow_next != 0);
++}
++
++/* cow.c */
++extern struct ext2_cow_mutex *ext2_get_cow_mutex(struct ext2_sb_info *sb, ino_t root);
++extern void ext2_put_cow_mutex(struct ext2_sb_info *sb, struct ext2_cow_mutex *mutex);
++
++void ext2_cow_put_list_of(struct inode *inode);
++int ext2_cow_get_list_of(struct inode *inode);
++int ext2_unlink_cow(struct inode *inode);
++
+ /* balloc.c */
+ extern int ext2_bg_has_super(struct super_block *sb, int group);
+ extern unsigned long ext2_bg_num_gdb(struct super_block *sb, int group);
+diff --git a/fs/ext2/file.c b/fs/ext2/file.c
+index 3a0a6c6..dc6e77e 100644
+--- a/fs/ext2/file.c
++++ b/fs/ext2/file.c
+@@ -64,9 +64,9 @@ static int ext2_file_mmap(struct file *file, struct vm_area_struct *vma)
+ static int ext2_release_file (struct inode * inode, struct file * filp)
+ {
+ 	if (filp->f_mode & FMODE_WRITE) {
+-		mutex_lock(&EXT2_I(inode)->truncate_mutex);
++		mutex_lock(EXT2_I(inode)->truncate_mutex);
+ 		ext2_discard_reservation(inode);
+-		mutex_unlock(&EXT2_I(inode)->truncate_mutex);
++		mutex_unlock(EXT2_I(inode)->truncate_mutex);
+ 	}
+ 	return 0;
+ }
+diff --git a/fs/ext2/ialloc.c b/fs/ext2/ialloc.c
+index 5c04a0d..9358daf 100644
+--- a/fs/ext2/ialloc.c
++++ b/fs/ext2/ialloc.c
+@@ -440,6 +440,7 @@ struct inode *ext2_new_inode(struct inode *dir, umode_t mode,
+ 	struct ext2_super_block *es;
+ 	struct ext2_inode_info *ei;
+ 	struct ext2_sb_info *sbi;
++	struct ext2_cow_mutex *cowmutex;
+ 	int err;
+ 
+ 	sb = dir->i_sb;
+@@ -564,6 +565,8 @@ got:
+ 	ei->i_block_alloc_info = NULL;
+ 	ei->i_block_group = group;
+ 	ei->i_dir_start_lookup = 0;
++	ei->i_cow_root = 0;
++	ei->i_cow_next = 0;
+ 	ei->i_state = EXT2_STATE_NEW;
+ 	ext2_set_inode_flags(inode);
+ 	spin_lock(&sbi->s_next_gen_lock);
+@@ -576,7 +579,6 @@ got:
+ 		err = -EIO;
+ 		goto fail;
+ 	}
+-
+ 	dquot_initialize(inode);
+ 	err = dquot_alloc_inode(inode);
+ 	if (err)
+@@ -590,6 +592,14 @@ got:
+ 	if (err)
+ 		goto fail_free_drop;
+ 
++	cowmutex = ext2_get_cow_mutex(sbi, ino);
++	if (unlikely(!cowmutex)) {
++		err = -ENOMEM;
++		goto fail_free_drop;
++	}
++
++	ei->truncate_mutex = &cowmutex->mutex;
++
+ 	mark_inode_dirty(inode);
+ 	ext2_debug("allocating inode %lu\n", inode->i_ino);
+ 	ext2_preread_inode(inode);
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index f460ae3..7c39e9c 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -37,6 +37,10 @@
+ #include "xattr.h"
+ 
+ static int __ext2_write_inode(struct inode *inode, int do_sync);
++static int ext2_cow_dedup_if_shared(struct inode *inode, sector_t iblock, struct buffer_head *bh);
++static int ext2_check_shared_block(struct inode *inode, sector_t iblock, ext2_fsblk_t fblock);
++static int ext2_cow_dedup(struct inode *inode, sector_t iblock, struct buffer_head *bh);
++static int ext2_cow_dedup_raw(struct inode *inode, sector_t iblock, ext2_fsblk_t *new_block);
+ 
+ /*
+  * Test whether an inode is a fast symlink.
+@@ -68,7 +72,7 @@ static void ext2_write_failed(struct address_space *mapping, loff_t to)
+ void ext2_evict_inode(struct inode * inode)
+ {
+ 	struct ext2_block_alloc_info *rsv;
+-	int want_delete = 0;
++	int want_delete = 0, failed = 0;
+ 
+ 	if (!inode->i_nlink && !is_bad_inode(inode)) {
+ 		want_delete = 1;
+@@ -90,6 +94,10 @@ void ext2_evict_inode(struct inode * inode)
+ 		if (inode->i_blocks)
+ 			ext2_truncate_blocks(inode, 0);
+ 		ext2_xattr_delete_inode(inode);
++		failed = ext2_unlink_cow(inode);	
++		if (unlikely(IS_ERR_VALUE(failed))) {
++			printk(KERN_ERR "Unable to unlink a cow inode. The fs may be corrupted :(\n");
++		}
+ 	}
+ 
+ 	invalidate_inode_buffers(inode);
+@@ -102,9 +110,16 @@ void ext2_evict_inode(struct inode * inode)
+ 		kfree(rsv);
+ 
+ 	if (want_delete) {
+-		ext2_free_inode(inode);
++		if (likely(!failed)) {
++			ext2_free_inode(inode);
++		}
+ 		sb_end_intwrite(inode->i_sb);
+ 	}
++
++	if (likely(EXT2_I(inode)->truncate_mutex)) {
++		ext2_put_cow_mutex(EXT2_SB(inode->i_sb), EXT2_COW_MUTEX(inode));
++		EXT2_I(inode)->truncate_mutex = NULL;
++	}
+ }
+ 
+ typedef struct {
+@@ -522,7 +537,6 @@ static int ext2_alloc_branch(struct inode *inode,
+ 		mark_buffer_dirty_inode(bh, inode);
+ 		/* We used to sync bh here if IS_SYNC(inode).
+ 		 * But we now rely upon generic_write_sync()
+-		 * and b_inode_buffers.  But not for directories.
+ 		 */
+ 		if (S_ISDIR(inode->i_mode) && IS_DIRSYNC(inode))
+ 			sync_dirty_buffer(bh);
+@@ -540,6 +554,246 @@ failed:
+ }
+ 
+ /**
++ * Checks how many blocks from the branch @chain..@chain + @chain_length - 1
++ * (the target chain) are not shared with inode @inode.
++ *
++ * The truncate_mutex must be locked, and the cow list must be held in memory.
++ * Returns negative values on errors, number of blocks that are not shared otherwise.
++ */
++static int __ext2_cow_check_own_length_with(struct inode *inode,
++		int chain_length, int depth,
++		Indirect *chain, int *offsets) {
++	Indirect my_chain[4], *partial, *last;
++	int ret;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++	ret = -EIO;
++
++	partial = ext2_get_branch(inode, depth, offsets, my_chain, &ret);
++	if (IS_ERR_VALUE(ret)) {
++		goto cleanup;
++	}
++
++	last = partial;
++	if (!partial) {
++		partial = &my_chain[depth];
++	}
++
++	if (chain_length > partial - my_chain) {
++		/* Our branch is shorter, so we cannot share anything with
++		 * the target chain
++		 */
++		ret = chain_length;
++		goto cleanup;
++	}
++
++	for (ret = chain_length; ret > 0; --ret) {
++		if (chain[ret - 1].key != my_chain[ret - 1].key) {
++			break;
++		}
++	}
++
++cleanup:
++	if (!last)
++		last = my_chain + depth - 1;
++	while (last > my_chain) {
++		bforget(last->bh);
++		last--;
++	}
++	return ret;
++}
++
++/**
++ * Checks how many blocks from the branch @chain..@chain + @chain_length - 1
++ * are not shared with any other cowed inodes.
++ *
++ * The truncate_mutex must be locked, and the cow list must be held in memory.
++ * Returns negative values on errors, number of blocks that are not shared otherwise.
++ */
++static int ext2_cow_check_own_length(struct inode *inode,
++		int chain_length, int depth,
++		Indirect *chain, int *offsets) {
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	ino_t ino = ei->i_cow_root;
++	struct inode *cur = NULL;
++	int ret = 0;
++	int mx = chain_length;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++
++	if (!ext2_is_cowed(inode)) {
++		return mx;
++	}
++
++	while (ino && !ret) {
++		cur = iget_locked(inode->i_sb, ino);
++		BUG_ON(cur->i_state & I_NEW);
++
++		BUG_ON(EXT2_I(inode)->truncate_mutex != EXT2_I(cur)->truncate_mutex);
++
++		if (ino != inode->i_ino) {
++			int cur_shared = __ext2_cow_check_own_length_with(
++					cur, chain_length, depth, chain, offsets);
++			if (IS_ERR_VALUE(cur_shared)) {
++				ret = cur_shared;
++				goto out;
++			}
++			if (cur_shared < mx) {
++				mx = cur_shared;
++			}
++		}
++
++out:
++		ino = EXT2_I(cur)->i_cow_next;
++		iput(cur);
++	}
++
++	if (!IS_ERR_VALUE(ret)) {
++		ret = mx;
++	}
++
++	return mx;
++}
++
++/**
++ * ext2_cow_copy_branch - deduplicate indirect blocks
++ * @inode: inode in question
++ * @num: number of indirect blocks
++ * @blks: respective Indirect structures
++ * @offsets: offsets of pointers in inode/indirect blocks
++ *
++ * @blks[0]..@blks[@num] represent the branch to be cloned
++ * as in ext2_get_branch -- hence, blks[0].key is the first
++ * block to be cloned, and blks[num].bh is the correct buffer-head
++ * containing the last indirect block to be cloned.
++ *
++ * Returns 0 on success, negative values on error.
++ * The truncate_mutex must be locked and the cow list must be held
++ * in memory.
++ */
++static int ext2_cow_copy_branch(struct inode *inode,
++		int num, Indirect *blks, int *offsets) {
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	ext2_fsblk_t goal = blks[0].key; /* whatever */
++	ext2_fsblk_t new_blocks[4];
++	struct buffer_head *bh[4];
++	int err, i;
++
++	BUG_ON(!mutex_is_locked(ei->truncate_mutex));
++	BUG_ON(num <= 0);
++	BUG_ON(num > 4);
++
++	if (S_ISREG(inode->i_mode) && (!ei->i_block_alloc_info))
++		ext2_init_block_alloc_info(inode);
++
++	ext2_alloc_blocks(inode, goal, num - 1,
++				1, new_blocks, &err);
++	if (unlikely(err)) {
++		return err;
++	}
++
++	for (i = 0; i < num; ++i) {
++		bh[i] = sb_getblk(inode->i_sb, new_blocks[i]);
++		if (unlikely(!bh[i])) {
++			err = -ENOMEM;
++			goto failed;
++		}
++	}
++
++	for (i = 0; i < num; ++i) {
++		lock_buffer(bh[i]);
++		BUG_ON(bh[i]->b_size != blks[i + 1].bh->b_size);
++		memcpy(bh[i]->b_data, blks[i + 1].bh->b_data, bh[i]->b_size);
++		bforget(blks[i + 1].bh);
++		blks[i + 1].bh = bh[i];
++		if (i > 0) {
++			blks[i].p = (__le32*) blks[i].bh->b_data + offsets[i];
++		}
++		blks[i].key = cpu_to_le32(new_blocks[i]);
++
++		write_lock(&EXT2_I(inode)->i_meta_lock);
++		*blks[i].p = blks[i].key;
++		write_unlock(&EXT2_I(inode)->i_meta_lock);
++
++		set_buffer_uptodate(bh[i]);
++		unlock_buffer(bh[i]);
++	}
++
++	BUG_ON(!verify_chain(blks, blks + num - 1));
++
++	if (blks[0].bh) {
++		/* We have attached ourselves to an indirect block */
++		mark_buffer_dirty_inode(blks[0].bh, inode);
++	}
++	else {
++		mark_inode_dirty(inode);
++	}
++
++	for (i = 0; i < num; ++i) {
++		mark_buffer_dirty_inode(bh[i], inode);
++	}
++
++	if (blks[num].bh) {
++		blks[num].p = (__le32*)blks[num].bh->b_data + offsets[num];
++	}
++
++	return 0;
++
++failed:
++	for (--i; i >= 0; --i) {
++		bforget(bh[i]);
++	}
++	for (i = 0; i < num; ++i) {
++		ext2_free_blocks(inode, new_blocks[i], 1);
++	}
++	return err;
++}
++
++/**
++ * ext2_cow_unshare - unshare any common indirect blocks
++ *
++ * @chain[0]..@chain[@chain_length] represent the branch
++ * to be checked, as in ext2_cow_copy_branch
++ *
++ * The truncate_mutex must be locked and the cow list must be held
++ * in memory.
++ */
++static int ext2_cow_unshare(struct inode *inode,
++		int chain_length, Indirect *chain, int *offsets, int depth) {
++
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	int own_length, err;
++
++	BUG_ON(!mutex_is_locked(ei->truncate_mutex));
++
++	own_length = ext2_cow_check_own_length(inode,
++			chain_length, depth, chain, offsets);
++	if (IS_ERR_VALUE(own_length)) {
++		return own_length;
++	}
++
++	if (own_length == chain_length) {
++		/* Nothing to unshare, everything is already owned solely by us */
++		return 0;
++	}
++
++	err = ext2_cow_copy_branch(inode,
++			chain_length - own_length,
++			chain + own_length,
++			offsets + own_length);
++
++	if (IS_ERR_VALUE(err)) {
++		return err;
++	}
++
++	own_length = ext2_cow_check_own_length(inode,
++			chain_length, depth, chain, offsets);
++	BUG_ON(own_length != chain_length);
++
++	return 0;
++}
++
++/**
+  * ext2_splice_branch - splice the allocated branch onto inode.
+  * @inode: owner
+  * @block: (logical) number of block we are adding
+@@ -629,6 +883,7 @@ static int ext2_get_blocks(struct inode *inode,
+ 	int depth;
+ 	struct ext2_inode_info *ei = EXT2_I(inode);
+ 	int count = 0;
++	int cowed = 0;
+ 	ext2_fsblk_t first_block = 0;
+ 
+ 	BUG_ON(maxblocks == 0);
+@@ -638,12 +893,27 @@ static int ext2_get_blocks(struct inode *inode,
+ 	if (depth == 0)
+ 		return (err);
+ 
++	if (create && ext2_is_cowed(inode)) {
++		cowed = 1;
++		maxblocks = 1; /* Return at most 1 block -- avoid unnecessary deduplication */
++		BUG_ON(!ei->truncate_mutex);
++		mutex_lock(ei->truncate_mutex);
++		err = ext2_cow_get_list_of(inode);
++		if (IS_ERR_VALUE(err)) {
++			mutex_unlock(ei->truncate_mutex);
++			return err;
++		}
++	}
++
++	err = -EIO;
++
+ 	partial = ext2_get_branch(inode, depth, offsets, chain, &err);
+ 	/* Simplest case - block found, no allocation needed */
+ 	if (!partial) {
+ 		first_block = le32_to_cpu(chain[depth - 1].key);
+ 		clear_buffer_new(bh_result); /* What's this do? */
+ 		count++;
++
+ 		/*map more blocks*/
+ 		while (count < maxblocks && count <= blocks_to_boundary) {
+ 			ext2_fsblk_t blk;
+@@ -673,7 +943,8 @@ static int ext2_get_blocks(struct inode *inode,
+ 	if (!create || err == -EIO)
+ 		goto cleanup;
+ 
+-	mutex_lock(&ei->truncate_mutex);
++	if (!cowed)
++		mutex_lock(ei->truncate_mutex);
+ 	/*
+ 	 * If the indirect block is missing while we are reading
+ 	 * the chain(ext2_get_branch() returns -EAGAIN err), or
+@@ -694,7 +965,8 @@ static int ext2_get_blocks(struct inode *inode,
+ 		partial = ext2_get_branch(inode, depth, offsets, chain, &err);
+ 		if (!partial) {
+ 			count++;
+-			mutex_unlock(&ei->truncate_mutex);
++			if (!cowed)
++				mutex_unlock(ei->truncate_mutex);
+ 			if (err)
+ 				goto cleanup;
+ 			clear_buffer_new(bh_result);
+@@ -719,6 +991,16 @@ static int ext2_get_blocks(struct inode *inode,
+ 	 */
+ 	count = ext2_blks_to_allocate(partial, indirect_blks,
+ 					maxblocks, blocks_to_boundary);
++
++	if (cowed) {
++		err = ext2_cow_unshare(inode, partial - chain, chain, offsets, depth);
++		if (err) {
++			goto cleanup;
++		}
++
++		BUG_ON(!verify_chain(chain, partial));
++	}
++
+ 	/*
+ 	 * XXX ???? Block out ext2_truncate while we alter the tree
+ 	 */
+@@ -726,7 +1008,8 @@ static int ext2_get_blocks(struct inode *inode,
+ 				offsets + (partial - chain), partial);
+ 
+ 	if (err) {
+-		mutex_unlock(&ei->truncate_mutex);
++		if (!cowed)
++			mutex_unlock(ei->truncate_mutex);
+ 		goto cleanup;
+ 	}
+ 
+@@ -739,19 +1022,40 @@ static int ext2_get_blocks(struct inode *inode,
+ 		err = dax_clear_blocks(inode, le32_to_cpu(chain[depth-1].key),
+ 						1 << inode->i_blkbits);
+ 		if (err) {
+-			mutex_unlock(&ei->truncate_mutex);
++			if (!cowed)
++				mutex_unlock(ei->truncate_mutex);
+ 			goto cleanup;
+ 		}
+ 	}
+ 
+ 	ext2_splice_branch(inode, iblock, partial, indirect_blks, count);
+-	mutex_unlock(&ei->truncate_mutex);
++	if (!cowed)
++		mutex_unlock(ei->truncate_mutex);
+ 	set_buffer_new(bh_result);
+ got_it:
+ 	map_bh(bh_result, inode->i_sb, le32_to_cpu(chain[depth-1].key));
+ 	if (count > blocks_to_boundary)
+ 		set_buffer_boundary(bh_result);
++
+ 	err = count;
++
++	if (cowed && !buffer_new(bh_result)) {
++		int shared = ext2_check_shared_block(inode, iblock, bh_result->b_blocknr);
++		if (IS_ERR_VALUE(shared)) {
++			err = shared;
++		}
++		else if (shared) {
++			ext2_fsblk_t newblock;
++			int err2 = ext2_cow_dedup_raw(inode, iblock, &newblock);
++			if (IS_ERR_VALUE(err2))
++				err = err2;
++			else {
++				map_bh(bh_result, inode->i_sb, newblock);
++				unmap_underlying_metadata(bh_result->b_bdev, bh_result->b_blocknr);
++			}
++		}
++	}
++
+ 	/* Clean up and exit */
+ 	partial = chain + depth - 1;	/* the whole chain */
+ cleanup:
+@@ -759,6 +1063,10 @@ cleanup:
+ 		brelse(partial->bh);
+ 		partial--;
+ 	}
++	if (cowed) {
++		ext2_cow_put_list_of(inode);
++		mutex_unlock(ei->truncate_mutex);
++	}
+ 	return err;
+ }
+ 
+@@ -775,6 +1083,329 @@ int ext2_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_
+ 
+ }
+ 
++/**
++ * Checks if a block is shared with some other cowed file.
++ * That is, if iblock'th block of any other file on the cow-list is equal
++ * to fblock.
++ *
++ * Returns 1 if this block is shared, 0 if not, negative value on errors.
++ * Truncate mutex must be held and the cow list must be kept in-memory.
++ */
++static int ext2_check_shared_block(struct inode *inode, sector_t iblock, ext2_fsblk_t fblock) {
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	ino_t ino = ei->i_cow_root;
++	struct inode *cur = NULL;
++	int ret = 0;
++
++	BUG_ON(!mutex_is_locked(ei->truncate_mutex));
++	BUG_ON(!S_ISREG(inode->i_mode));
++
++	if (!ext2_is_cowed(inode)) {
++		return 0;
++	}
++
++	while (ino && !ret) {
++		cur = iget_locked(inode->i_sb, ino);
++		BUG_ON(cur->i_state & I_NEW);
++
++		if (ino != inode->i_ino) {
++			Indirect chain[4], *partial;
++			int offsets[4], blocks_to_boundnary = 0, depth;
++
++			depth = ext2_block_to_path(cur, iblock, offsets, &blocks_to_boundnary);
++			if (depth == 0) {
++				ret = -EIO;
++				goto out;
++			}
++
++			partial = ext2_get_branch(cur, depth, offsets, chain, &ret);
++
++			if (!partial && le32_to_cpu(chain[depth - 1].key) == fblock) {
++				if (!ret) {
++					ret = 1;
++				}
++				goto out;
++			}
++
++out:
++			if (!partial) {
++				partial = chain + depth - 1;
++			}
++			while (partial > chain) {
++				brelse(partial->bh);
++				partial--;
++			}
++		}
++
++		ino = EXT2_I(cur)->i_cow_next;
++		iput(cur);
++	}
++
++	return ret;
++}
++
++/**
++ * Duplicates a block @iblock of inode @inode. Stores the on-disk number of the new
++ * block in @new_block.
++ *
++ * The block is copied (synchronuously), so no stale data will leak.
++ * The block must be already present in the file.
++ * The branch leading to it will be unshared, if necessary.
++ *
++ * Returns 0 on success, negative values on error.
++ * The trunctae_mutex must be locked and the COW list held in memory.
++ */
++static int ext2_cow_dedup_raw(struct inode *inode, sector_t iblock, ext2_fsblk_t *new_block) {
++	int err = -EIO;
++	int offsets[4];
++	Indirect chain[4];
++	Indirect *partial;
++	ext2_fsblk_t goal, target;
++	int blocks_to_boundary = 0;
++	int depth;
++	unsigned long count = 1;
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	struct buffer_head *bh_old, *bh_new;
++
++	BUG_ON(!mutex_is_locked(ei->truncate_mutex));
++	BUG_ON(!S_ISREG(inode->i_mode));
++
++	depth = ext2_block_to_path(inode, iblock, offsets, &blocks_to_boundary);
++
++	if (depth == 0) {
++		return -EIO;
++	}
++
++	if (!ei->i_block_alloc_info) {
++		ext2_init_block_alloc_info(inode);
++	}
++
++	partial = ext2_get_branch(inode, depth, offsets, chain, &err);
++	if (err) {
++		goto out;
++	}
++
++	BUG_ON(partial);
++
++	err = ext2_cow_unshare(inode, depth - 1, chain, offsets, depth);
++	if (err) {
++		goto out;
++	}
++
++	partial = &chain[depth - 1];
++	BUG_ON(*partial->p != partial->key);
++
++	goal = ext2_find_goal(inode, iblock, partial);
++
++	target = ext2_new_blocks(inode, goal, &count, &err);
++	if (err) {
++		ext2_debug("Unable to allocate blocks: %d\n", err);
++		goto out;
++	}
++
++	bh_old = sb_bread(inode->i_sb, iblock);
++	if (!bh_old) {
++		err = -EIO;
++		goto out_free;
++	}
++
++	bh_new = sb_getblk(inode->i_sb, target);
++	if (!bh_new) {
++		err = -ENOMEM;
++		goto out_bforget;
++	}
++
++	*new_block = target;
++
++	BUG_ON(bh_new->b_size != bh_old->b_size);
++
++	memcpy(bh_new->b_data, bh_old->b_data, bh_new->b_size);
++
++	set_buffer_uptodate(bh_new);
++	mark_buffer_dirty_inode(bh_new, inode);
++
++	*partial->p = cpu_to_le32(target);
++	if (partial->bh) {
++		mark_buffer_dirty_inode(partial->bh, inode);
++	}
++	else {
++		mark_inode_dirty(inode);
++	}
++
++	brelse(bh_new);
++out_bforget:
++	bforget(bh_old);
++out_free:
++	if (IS_ERR_VALUE(err)) {
++		ext2_free_blocks(inode, target, 1);
++	}
++out:
++	while (partial > chain) {
++		brelse(partial->bh);
++		partial--;
++	}
++	return err;
++}
++
++static int ext2_cow_dedup(struct inode *inode, sector_t iblock, struct buffer_head *bh) {
++	ext2_fsblk_t newblock;
++	int err;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++	BUG_ON(!buffer_mapped(bh));
++
++	err = ext2_cow_dedup_raw(inode, iblock, &newblock);
++
++	if (IS_ERR_VALUE(err)) {
++		return err;
++	}
++
++	map_bh(bh, inode->i_sb, newblock);
++	unmap_underlying_metadata(bh->b_bdev, bh->b_blocknr);
++	mark_buffer_dirty(bh);
++
++	return 0;
++}
++
++/**
++ * Checks if a block is shared with some other cowed file.
++ * That is, if iblock'th block of any other file on the cow-list is equal
++ * to fblock. If so, deduplicate this block.
++ *
++ * Returns 0 on success, negative values on error.
++ * Truncate mutex must be held and the cow list must be kept in-memory.
++ */
++static int ext2_cow_dedup_if_shared(struct inode *inode, sector_t iblock, struct buffer_head *bh) {
++	int shared;
++	ext2_fsblk_t fblock;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++	BUG_ON(!S_ISREG(inode->i_mode));
++
++	if (!buffer_mapped(bh)) {
++		/* Holes need not to be unshared */
++		return 0;
++	}
++
++	fblock = bh->b_blocknr;
++	shared = ext2_check_shared_block(inode, iblock, fblock);
++	if (IS_ERR_VALUE(shared) || shared == 0) {
++		return shared;
++	}
++
++	return ext2_cow_dedup(inode, iblock, bh);
++}
++
++/**
++ * Deduplicates all shared blocks referenced by the provided page in the
++ * requested range. Only mapped blocks are deduplicated.
++ *
++ * Returns 0 on success, negative values on error.
++ * The page must be locked, uptodate and have mapped buffers.
++ * Moreover, the inode's truncate_mutex must be locked and the COW list must
++ * be held in memory.
++ */
++int ext2_cow_dedup_page_if_shared_locked(struct page *page, loff_t pos, unsigned len, bool only_dirty) {
++	unsigned from = pos & (PAGE_SIZE - 1);
++	unsigned to = from + len;
++	struct inode *inode;
++	unsigned block_start, block_end;
++	sector_t block;
++	struct buffer_head *head, *bh;
++	unsigned blocksize, bbits;
++	int err;
++
++	BUG_ON(!page->mapping);
++	BUG_ON(!page->mapping->host);
++
++ 	inode = page->mapping->host;
++
++	if (!S_ISREG(inode->i_mode)) {
++		return 0;
++	}
++
++	BUG_ON(!EXT2_I(inode)->truncate_mutex);
++	BUG_ON(!mutex_is_locked(EXT2_I(inode)->truncate_mutex));
++	BUG_ON(!PageLocked(page));
++
++	if (!page_has_buffers(page)) {
++		return 0;
++	}
++
++	head = page_buffers(page);
++	blocksize = head->b_size;
++	bbits = ilog2(blocksize);
++
++	block = (sector_t)page->index << (PAGE_SHIFT - bbits);
++
++	for(bh = head, block_start = 0; bh != head || !block_start;
++			block++, block_start = block_end, bh = bh->b_this_page) {
++		block_end = block_start + blocksize;
++		if (block_end <= from || block_start >= to) {
++			continue;
++		}
++
++		if (only_dirty && !buffer_dirty(bh)) {
++			continue;
++		}
++
++		if (!buffer_mapped(bh)) {
++			/* This block is not mapped yet. It will be possibly
++			 * deduplicated at the next call to ext2_get_block
++			 * with create = 1. Until then, this buffer_head is
++			 * useless, so there is no need to deduplicate it.
++			 */
++			continue;
++		}
++
++		err = ext2_cow_dedup_if_shared(inode, block, bh);
++		if (IS_ERR_VALUE(err)) {
++			/* Some blocks may have been deduplicated by the previous
++			 * iterations. But we don't care -- it results only in greater
++			 * disk space usage, but has otherwise no detrimental effects.
++			 */
++			return err;
++		}
++	}
++
++	return 0;
++}
++
++/**
++ * Deduplicates all buffers in @page representing the range @pos...@pos+@len-1.
++ * If @only_dirty, only the dirty buffers need to be deduplicated.
++ *
++ * The page must be locked.
++ *
++ * Returns 0 on success, negative values on error.
++ */
++int ext2_cow_dedup_page_if_shared(struct page *page, loff_t pos, unsigned len, bool only_dirty) {
++	struct inode *inode = page->mapping->host;
++	int ret = 0;
++
++	BUG_ON(!inode);
++	BUG_ON(!EXT2_I(inode)->truncate_mutex);
++	BUG_ON(!page);
++	BUG_ON(!PageLocked(page));
++
++	if (!ext2_is_cowed(inode)) {
++		return 0;
++	}
++
++	mutex_lock(EXT2_I(inode)->truncate_mutex);
++	ret = ext2_cow_get_list_of(inode);
++	if (IS_ERR_VALUE(ret)) {
++		goto out;
++	}
++
++	ret = ext2_cow_dedup_page_if_shared_locked(page, pos, len, only_dirty);
++
++	ext2_cow_put_list_of(inode);
++out:
++	mutex_unlock(EXT2_I(inode)->truncate_mutex);
++	return ret;
++}
++
+ int ext2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+ 		u64 start, u64 len)
+ {
+@@ -784,6 +1415,17 @@ int ext2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+ 
+ static int ext2_writepage(struct page *page, struct writeback_control *wbc)
+ {
++	/* block_write_full_page will only write dirty buffers.
++	 * So we deduplicate only them.
++	 */
++	int err = ext2_cow_dedup_page_if_shared(page, 0, PAGE_SIZE, 1);
++	if (IS_ERR_VALUE(err)) {
++		SetPageError(page);
++		mapping_set_error(page->mapping, err);
++		unlock_page(page);
++		return err;
++	}
++
+ 	return block_write_full_page(page, ext2_get_block, wbc);
+ }
+ 
+@@ -804,12 +1446,24 @@ ext2_write_begin(struct file *file, struct address_space *mapping,
+ 		loff_t pos, unsigned len, unsigned flags,
+ 		struct page **pagep, void **fsdata)
+ {
+-	int ret;
++	int ret, err;
+ 
+ 	ret = block_write_begin(mapping, pos, len, flags, pagep,
+ 				ext2_get_block);
+-	if (ret < 0)
++	if (ret < 0) {
++		ext2_write_failed(mapping, pos + len);
++		return ret;
++	}
++
++	err = ext2_cow_dedup_page_if_shared(*pagep, pos, len, 0);
++	if (IS_ERR_VALUE(err)) {
++		unlock_page(*pagep);
++		put_page(*pagep);
++		*pagep = NULL;
+ 		ext2_write_failed(mapping, pos + len);
++		return err;
++	}
++
+ 	return ret;
+ }
+ 
+@@ -965,6 +1619,15 @@ static Indirect *ext2_find_shared(struct inode *inode,
+ 	partial = ext2_get_branch(inode, k, offsets, chain, &err);
+ 	if (!partial)
+ 		partial = chain + k-1;
++
++	if (k > 1) {
++		/* Unshare the path, because we will be writing 0s on it */
++		err = ext2_cow_unshare(inode, k - 1, chain, offsets, depth);
++		if (IS_ERR_VALUE(err)) {
++			goto out;
++		}
++	}
++
+ 	/*
+ 	 * If the branch acquired continuation since we've looked at it -
+ 	 * fine, it should all survive and (new) top doesn't belong to us.
+@@ -990,6 +1653,7 @@ static Indirect *ext2_find_shared(struct inode *inode,
+ 	}
+ 	write_unlock(&EXT2_I(inode)->i_meta_lock);
+ 
++out:
+ 	while(partial > p)
+ 	{
+ 		brelse(partial->bh);
+@@ -1049,7 +1713,7 @@ static inline void ext2_free_data(struct inode *inode, __le32 *p, __le32 *q)
+  *	stored as little-endian 32-bit) and updating @inode->i_blocks
+  *	appropriately.
+  */
+-static void ext2_free_branches(struct inode *inode, __le32 *p, __le32 *q, int depth)
++static void ext2_free_branches(struct inode *inode,  __le32 *p, __le32 *q, int depth)
+ {
+ 	struct buffer_head * bh;
+ 	unsigned long nr;
+@@ -1084,6 +1748,150 @@ static void ext2_free_branches(struct inode *inode, __le32 *p, __le32 *q, int de
+ 		ext2_free_data(inode, p, q);
+ }
+ 
++/**
++ * Traverses the block subtrees rooted at *@p_self and @p_other
++ * of inodes @self and @other and checks if any block is shared.
++ * If so, it saves 0 in the @self's subtree, so that the subsequent
++ * truncate would not free the blocks.
++ *
++ * Returns 1 if something was saved (the buffer should be dirtied),
++ * 0 otherwise.
++ */
++static bool __ext2_cow_truncate_branch(struct inode *self, struct inode *other,
++		__le32 *p_self, __le32 p_other, int depth) {
++	struct buffer_head *bh_self, *bh_other;
++	int addr_per_block = EXT2_ADDR_PER_BLOCK(self->i_sb), i;
++	bool dirtied = false;
++
++	BUG_ON(!mutex_is_locked(EXT2_I(self)->truncate_mutex));
++	BUG_ON(EXT2_I(self)->truncate_mutex != EXT2_I(other)->truncate_mutex);
++
++	if (!*p_self || !p_other) {
++		return false;
++	}
++
++	if (*p_self == p_other) {
++		*p_self = 0;
++
++		return true;
++	}
++
++	if (depth == 1) {
++		return false;
++	}
++
++	bh_self = sb_bread(self->i_sb, le32_to_cpu(*p_self));
++	if (!bh_self) {
++		/* Unlink the branch. No data loss will occur. */
++		*p_self = 0;
++		return true;
++	}
++
++	bh_other = sb_bread(other->i_sb, le32_to_cpu(p_other));
++	if (!bh_other) {
++		/* Unlink the branch. No data loss will occur. */
++		*p_self = 0;
++		brelse(bh_self);
++		return true;
++	}
++
++	for (i = 0; i < addr_per_block; ++i) {
++		dirtied |= __ext2_cow_truncate_branch(self, other, (__le32*)bh_self->b_data + i,
++				*(__le32*)bh_other->b_data + i, depth - 1);
++	}
++
++	if (dirtied) {
++		mark_buffer_dirty_inode(bh_self, self);
++	}
++
++	bforget(bh_other);
++	brelse(bh_self);
++	return false;
++}
++
++/**
++ * Unlinks some subtrees of @inode, so that the subsequent truncate would not deallocate them.
++ * @inode: inode in question
++ * @p: pointer to the address of the subtree to search
++ * @offsets: offsets to it
++ * @depth: the depth of the root of the subtree (1, if *@p grows directly from the inode etc)
++ * @total_depth: the total depth of the subtree (e.g. 4 if *@p is inside a tree rooted in a triple-indirect block)
++ */
++static void ext2_cow_truncate_branch(struct inode *inode, __le32 *p, int offsets[4], int depth, int total_depth) {
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	int tmp_depth;
++
++	BUG_ON(!mutex_is_locked(ei->truncate_mutex));
++
++	if (!ext2_is_cowed(inode)) {
++		return;
++	}
++
++	for (tmp_depth = 0; tmp_depth <= total_depth - depth && *p; ++tmp_depth) {
++		ino_t ino = ei->i_cow_root;
++		struct inode *cur;
++
++		while (ino) {
++			Indirect chain[4], *partial;
++			int err = 0;
++			bool dirtied;
++
++			if (ino == inode->i_ino) {
++				ino = EXT2_I(inode)->i_cow_next;
++				continue;
++			}
++
++			cur = iget_locked(inode->i_sb, ino);
++			BUG_ON(cur->i_state & I_NEW);
++
++			partial = ext2_get_branch(cur, depth, offsets, chain, &err);;
++			if (IS_ERR_VALUE(err)) {
++				/* Unlink the branch. No data loss will occur. */
++				*p = 0;
++				goto cleanup;
++			}
++
++			if (partial) {
++				/* Nothing to unshare */
++				goto cleanup;
++			}
++
++			partial = chain + depth - 1;
++
++			dirtied = __ext2_cow_truncate_branch(inode, cur,
++						p,
++						*partial->p,
++						depth + tmp_depth);
++
++			if (dirtied) {
++				if (partial > chain) {
++					mark_buffer_dirty_inode(partial->bh, inode);
++				}
++				else {
++					mark_inode_dirty(inode);
++				}
++			}
++
++cleanup:
++			while (partial > chain) {
++				brelse(partial->bh);
++				--partial;
++			}
++
++			ino = EXT2_I(cur)->i_cow_next;
++			iput(cur);
++		}
++	}
++
++	return;
++}
++
++static inline void ext2_cow_truncate_simple_branch(struct inode *inode, int entry) {
++	int offsets[4] = {entry, 0, 0, 0};
++	int depth = entry >= EXT2_NDIR_BLOCKS ? entry - EXT2_NDIR_BLOCKS + 2 : 1;
++	ext2_cow_truncate_branch(inode, &EXT2_I(inode)->i_data[entry], offsets, 1, depth);
++}
++
+ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ {
+ 	__le32 *i_data = EXT2_I(inode)->i_data;
+@@ -1093,9 +1901,11 @@ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ 	Indirect chain[4];
+ 	Indirect *partial;
+ 	__le32 nr = 0;
+-	int n;
++	int n, i;
+ 	long iblock;
+ 	unsigned blocksize;
++	int err;
++
+ 	blocksize = inode->i_sb->s_blocksize;
+ 	iblock = (offset + blocksize-1) >> EXT2_BLOCK_SIZE_BITS(inode->i_sb);
+ 
+@@ -1107,9 +1917,21 @@ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ 	 * From here we block out all ext2_get_block() callers who want to
+ 	 * modify the block allocation tree.
+ 	 */
+-	mutex_lock(&ei->truncate_mutex);
++	mutex_lock(ei->truncate_mutex);
++	err = ext2_cow_get_list_of(inode);	
++	if (IS_ERR_VALUE(err)) {
++		ext2_error(inode->i_sb, "__ext2_truncate_blocks",
++				"unable to truncate blocks: cow list "
++				"could not be loaded: inode %ld\n", inode->i_ino);
++		mutex_unlock(ei->truncate_mutex);
++		return;
++	}
+ 
+ 	if (n == 1) {
++		for (i = offsets[0]; i < EXT2_NDIR_BLOCKS; ++i) {
++			ext2_cow_truncate_simple_branch(inode, i);
++		}
++
+ 		ext2_free_data(inode, i_data+offsets[0],
+ 					i_data + EXT2_NDIR_BLOCKS);
+ 		goto do_indirects;
+@@ -1122,10 +1944,21 @@ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ 			mark_inode_dirty(inode);
+ 		else
+ 			mark_buffer_dirty_inode(partial->bh, inode);
+-		ext2_free_branches(inode, &nr, &nr+1, (chain+n-1) - partial);
++		ext2_cow_truncate_branch(inode, &nr, offsets, partial - chain + 1, n);
++
++		if (nr) {
++			/* The branch to be deleted is not shared */
++			ext2_free_branches(inode, &nr, &nr+1, (chain+n-1) - partial);
++		}
+ 	}
+ 	/* Clear the ends of indirect blocks on the shared branch */
+ 	while (partial > chain) {
++		int *offset = &offsets[partial - chain];
++		int orig = *offset;
++		for((void)*offset++; *offset < addr_per_block; ++*offset) {
++			ext2_cow_truncate_branch(inode, partial->p + *offset - orig, offsets, partial - chain + 1, n);
++		}
++
+ 		ext2_free_branches(inode,
+ 				   partial->p + 1,
+ 				   (__le32*)partial->bh->b_data+addr_per_block,
+@@ -1136,8 +1969,11 @@ static void __ext2_truncate_blocks(struct inode *inode, loff_t offset)
+ 	}
+ do_indirects:
+ 	/* Kill the remaining (whole) subtrees */
++
++	iblock = EXT2_IND_BLOCK * addr_per_block;
+ 	switch (offsets[0]) {
+ 		default:
++			ext2_cow_truncate_simple_branch(inode, EXT2_IND_BLOCK);
+ 			nr = i_data[EXT2_IND_BLOCK];
+ 			if (nr) {
+ 				i_data[EXT2_IND_BLOCK] = 0;
+@@ -1145,6 +1981,7 @@ do_indirects:
+ 				ext2_free_branches(inode, &nr, &nr+1, 1);
+ 			}
+ 		case EXT2_IND_BLOCK:
++			ext2_cow_truncate_simple_branch(inode, EXT2_DIND_BLOCK);
+ 			nr = i_data[EXT2_DIND_BLOCK];
+ 			if (nr) {
+ 				i_data[EXT2_DIND_BLOCK] = 0;
+@@ -1152,6 +1989,7 @@ do_indirects:
+ 				ext2_free_branches(inode, &nr, &nr+1, 2);
+ 			}
+ 		case EXT2_DIND_BLOCK:
++			ext2_cow_truncate_simple_branch(inode, EXT2_TIND_BLOCK);
+ 			nr = i_data[EXT2_TIND_BLOCK];
+ 			if (nr) {
+ 				i_data[EXT2_TIND_BLOCK] = 0;
+@@ -1164,7 +2002,8 @@ do_indirects:
+ 
+ 	ext2_discard_reservation(inode);
+ 
+-	mutex_unlock(&ei->truncate_mutex);
++	ext2_cow_put_list_of(inode);
++	mutex_unlock(ei->truncate_mutex);
+ }
+ 
+ static void ext2_truncate_blocks(struct inode *inode, loff_t offset)
+@@ -1308,7 +2147,7 @@ void ext2_get_inode_flags(struct ext2_inode_info *ei)
+ 		ei->i_flags |= EXT2_DIRSYNC_FL;
+ }
+ 
+-struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
++static struct inode *__ext2_iget (struct super_block *sb, unsigned long ino)
+ {
+ 	struct ext2_inode_info *ei;
+ 	struct buffer_head * bh;
+@@ -1327,6 +2166,8 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
+ 
+ 	ei = EXT2_I(inode);
+ 	ei->i_block_alloc_info = NULL;
++	ei->i_cow_root = 0;
++	ei->i_cow_next = 0;
+ 
+ 	raw_inode = ext2_get_inode(inode->i_sb, ino, &bh);
+ 	if (IS_ERR(raw_inode)) {
+@@ -1378,6 +2219,25 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
+ 	ei->i_block_group = (ino - 1) / EXT2_INODES_PER_GROUP(inode->i_sb);
+ 	ei->i_dir_start_lookup = 0;
+ 
++	ei->i_cow_root = le32_to_cpu(raw_inode->i_res_cow_root);
++	ei->i_cow_next = le32_to_cpu(raw_inode->i_res_cow_next);
++
++	if (ext2_is_cowed(inode)) {
++		if (IS_DAX(inode)) {
++			brelse(bh);
++			ext2_debug("DAX filesystem\n");
++			ret = -EINVAL;
++			goto bad_inode;
++		}
++
++		if (test_opt(inode->i_sb, NOBH)) {
++			brelse(bh);
++			ext2_debug("NOBH filesystem\n");
++			ret = -EINVAL;
++			goto bad_inode;
++		}
++	}
++
+ 	/*
+ 	 * NOTE! The in-memory inode i_data array is in little-endian order
+ 	 * even on big-endian machines: we do NOT byteswap the block numbers!
+@@ -1424,7 +2284,6 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
+ 	}
+ 	brelse (bh);
+ 	ext2_set_inode_flags(inode);
+-	unlock_new_inode(inode);
+ 	return inode;
+ 	
+ bad_inode:
+@@ -1432,6 +2291,40 @@ bad_inode:
+ 	return ERR_PTR(ret);
+ }
+ 
++
++
++struct inode *ext2_iget (struct super_block *sb, unsigned long ino) {
++	struct inode *inode = __ext2_iget(sb, ino);
++	struct ext2_cow_mutex *mutex;
++	ino_t root;
++
++	if (IS_ERR(inode)) {
++		return inode;
++	}
++
++	if (!(inode->i_state & I_NEW)) {
++		BUG_ON(!EXT2_I(inode)->truncate_mutex);
++		return inode;
++	}
++
++	root = EXT2_I(inode)->i_cow_root;
++	if (!root) {
++		root = ino;
++	}
++
++	mutex = ext2_get_cow_mutex(EXT2_SB(sb), root);
++	if (!mutex) {
++		iget_failed(inode);
++		EXT2_I(inode)->truncate_mutex = NULL;
++		return ERR_PTR(-ENOMEM);
++	}
++
++	EXT2_I(inode)->truncate_mutex = &mutex->mutex;
++
++	unlock_new_inode(inode);
++	return inode;
++}
++
+ static int __ext2_write_inode(struct inode *inode, int do_sync)
+ {
+ 	struct ext2_inode_info *ei = EXT2_I(inode);
+@@ -1508,6 +2401,9 @@ static int __ext2_write_inode(struct inode *inode, int do_sync)
+ 			}
+ 		}
+ 	}
++
++	raw_inode->i_res_cow_root = cpu_to_le32(ei->i_cow_root);
++	raw_inode->i_res_cow_next = cpu_to_le32(ei->i_cow_next);
+ 	
+ 	raw_inode->i_generation = cpu_to_le32(inode->i_generation);
+ 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
+diff --git a/fs/ext2/ioctl.c b/fs/ext2/ioctl.c
+index 5d46c09..93c92b6 100644
+--- a/fs/ext2/ioctl.c
++++ b/fs/ext2/ioctl.c
+@@ -9,6 +9,9 @@
+ 
+ #include "ext2.h"
+ #include <linux/capability.h>
++#include <linux/fsnotify.h>
++#include <linux/file.h>
++#include <linux/fs.h>
+ #include <linux/time.h>
+ #include <linux/sched.h>
+ #include <linux/compat.h>
+@@ -16,6 +19,187 @@
+ #include <asm/current.h>
+ #include <asm/uaccess.h>
+ 
++static long ext2_duplicate_fd(struct file *filp, int target_fd) {
++	struct file *target;
++	struct inode *inode, *target_inode;
++	struct ext2_inode_info *ext2_inode, *ext2_target_inode;
++	int ret, i;
++
++	ext2_debug("duplicating fd!\n");
++
++	if (target_fd < 0 || !(target = fget_raw(target_fd))) {
++		ext2_debug("Invalid target fd\n");
++		return -EBADF;
++	}
++
++	if (!(filp->f_mode & FMODE_READ)) {
++		ext2_debug("Source file is not readable\n");
++		ret = -EBADF;
++		goto out;
++	}
++
++	if (!(target->f_mode & FMODE_WRITE)) {
++		ext2_debug("Target file is not writable\n");
++		ret = -EBADF;
++		goto out;
++	}
++
++	if (file_inode(target)->i_sb != file_inode(filp)->i_sb) {
++		ext2_debug("Target file is placed on a different device\n");
++		ret = -EXDEV;
++		goto out;
++	}
++
++	inode = file_inode(filp);
++	target_inode = file_inode(target);
++
++	if (IS_DAX(inode)) {
++		ext2_debug("DAX filesystem\n");
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	if (test_opt(inode->i_sb, NOBH)) {
++		ext2_debug("NOBH filesystem\n");
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	if (S_ISDIR(inode->i_mode) || S_ISDIR(target_inode->i_mode)) {
++		ext2_debug("You are trying to COW a directory\n");
++		ret = -EISDIR;
++		goto out;
++	}
++
++	if (!S_ISREG(inode->i_mode) || !S_ISREG(target_inode->i_mode)) {
++		ext2_debug("You are trying to COW a special file\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (target_inode->i_mode & (S_ISUID | S_ISGID)) {
++		ext2_debug("You are trying to COW a setuid/setgid file\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (IS_APPEND(target_inode) || IS_IMMUTABLE(target_inode)) {
++		ext2_debug("Target is append-only or immutable\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (inode == target_inode) {
++		ext2_debug("Cannot COW a file to itself\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ret = mnt_want_write_file(target);
++	if (ret) {
++		ext2_debug("Unable to want write file\n");
++		goto out;
++	}
++
++	lock_two_nondirectories(inode, target_inode);
++
++	ret = get_write_access(target_inode);
++	if (ret) {
++		ext2_debug("Unable to get write access\n");
++		goto unlock_and_out;
++	}
++
++	ret = break_lease(target_inode, O_WRONLY);
++	if (ret) {
++		ext2_debug("Unable to break lease\n");
++		goto put_write_and_out;
++	}
++
++	if (target_inode->i_size != 0) {
++		ext2_debug("Target is not empty\n");
++		ret = -EINVAL;
++		goto put_write_and_out;
++	}
++
++	if (target_inode->i_mapping && target_inode->i_mapping->nrpages != 0) {
++		ext2_debug("Target has mapped pages\n");
++		ret = -EINVAL;
++		goto put_write_and_out;
++	}
++
++	ext2_inode = EXT2_I(inode);
++	ext2_target_inode = EXT2_I(target_inode);
++
++	if (ext2_target_inode->i_cow_root != 0) {
++		ext2_debug("The target inode has been already cowed...");
++		ret = -EINVAL;
++		goto put_write_and_out;	
++	}
++
++	ret = filemap_write_and_wait(inode->i_mapping);
++	if (ret) {
++		ext2_debug("Unable to flush pages");
++		goto put_write_and_out;
++	}
++
++	mutex_lock(ext2_inode->truncate_mutex);
++	if (inode->i_mapping->nrpages) {
++		ret = invalidate_inode_pages2(inode->i_mapping);
++		if (IS_ERR_VALUE(ret)) {
++			ext2_debug("Unable to invalidate mappings");
++			goto unlock_truncate_and_out;
++		}
++	}
++
++	ret = 0;
++
++	write_lock(&ext2_target_inode->i_meta_lock);
++	/* No need to take the read lock for ext2_inode: we hold its truncate_mutex,
++	 * so no one will modyfiy i_data
++	 */
++	for (i = 0; i < EXT2_N_BLOCKS; ++i) {
++		ext2_target_inode->i_data[i] = ext2_inode->i_data[i];
++	}
++	write_unlock(&ext2_target_inode->i_meta_lock);
++
++	if (ext2_inode->i_cow_root == 0) {
++		ext2_inode->i_cow_root = inode->i_ino;
++	}
++	
++	ext2_target_inode->i_cow_root = ext2_inode->i_cow_root;
++	ext2_target_inode->i_cow_next = ext2_inode->i_cow_next;
++	ext2_inode->i_cow_next = target_inode->i_ino;
++
++	ext2_put_cow_mutex(EXT2_SB(inode->i_sb), EXT2_COW_MUTEX(target_inode));
++
++	ext2_target_inode->truncate_mutex = ext2_inode->truncate_mutex;
++	atomic_inc(&EXT2_COW_MUTEX(target_inode)->refcount);
++
++	spin_lock(&target_inode->i_lock);
++	target_inode->i_blocks = inode->i_blocks;
++	target_inode->i_bytes = inode->i_bytes;
++	target_inode->i_ctime = CURRENT_TIME_SEC;
++	target_inode->i_mtime = CURRENT_TIME_SEC;
++	target_inode->i_size = inode->i_size;
++	spin_unlock(&target_inode->i_lock);
++
++	mark_inode_dirty_sync(inode);
++	mark_inode_dirty_sync(target_inode);
++
++	fsnotify_access(filp);
++	fsnotify_modify(target);
++
++unlock_truncate_and_out:
++	mutex_unlock(ext2_inode->truncate_mutex);
++put_write_and_out:
++	put_write_access(target_inode);
++unlock_and_out:
++	unlock_two_nondirectories(inode, target_inode);
++	mnt_drop_write_file(target);
++out:
++	fput(target);
++	return ret;
++}
+ 
+ long ext2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+@@ -23,6 +207,7 @@ long ext2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	struct ext2_inode_info *ei = EXT2_I(inode);
+ 	unsigned int flags;
+ 	unsigned short rsv_window_size;
++	int other_fd;
+ 	int ret;
+ 
+ 	ext2_debug ("cmd = %u, arg = %lu\n", cmd, arg);
+@@ -146,7 +331,7 @@ setversion_out:
+ 		 * XXX What lock should protect the rsv_goal_size?
+ 		 * Accessed in ext2_get_block only.  ext3 uses i_truncate.
+ 		 */
+-		mutex_lock(&ei->truncate_mutex);
++		mutex_lock(ei->truncate_mutex);
+ 		if (!ei->i_block_alloc_info)
+ 			ext2_init_block_alloc_info(inode);
+ 
+@@ -154,10 +339,17 @@ setversion_out:
+ 			struct ext2_reserve_window_node *rsv = &ei->i_block_alloc_info->rsv_window_node;
+ 			rsv->rsv_goal_size = rsv_window_size;
+ 		}
+-		mutex_unlock(&ei->truncate_mutex);
++		mutex_unlock(ei->truncate_mutex);
+ 		mnt_drop_write_file(filp);
+ 		return 0;
+ 	}
++	case EXT2_IOC_COWDUP: {
++		if (get_user(other_fd, (int __user *) arg)) {
++			return -EFAULT;
++		}
++
++		return ext2_duplicate_fd(filp, other_fd);
++	}
+ 	default:
+ 		return -ENOTTY;
+ 	}
+diff --git a/fs/ext2/super.c b/fs/ext2/super.c
+index d0e746e..f86439e 100644
+--- a/fs/ext2/super.c
++++ b/fs/ext2/super.c
+@@ -191,7 +191,7 @@ static void init_once(void *foo)
+ #ifdef CONFIG_EXT2_FS_XATTR
+ 	init_rwsem(&ei->xattr_sem);
+ #endif
+-	mutex_init(&ei->truncate_mutex);
++	ei->truncate_mutex = NULL;
+ 	inode_init_once(&ei->vfs_inode);
+ }
+ 
+@@ -806,6 +806,9 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 	sb->s_fs_info = sbi;
+ 	sbi->s_sb_block = sb_block;
+ 
++	sbi->s_cow_rbtree = RB_ROOT;
++	init_rwsem(&sbi->s_cow_rwsem);
++
+ 	spin_lock_init(&sbi->s_lock);
+ 
+ 	/*

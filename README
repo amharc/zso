@@ -1,0 +1,5 @@
+My solutions to programming assignments in Advanced Topics in Operating Systems @ MIMUW, Summer 2016.
+
+Assignment 1: `resurrecting' processes from core dumps
+Assignment 2: a simple 2d graphics device driver. Files: vintage2d.h and v2d_ioctl.h are not mine, but were provided together with the problem description.
+Assignment 3: adding a bit of copy-on-write machinery to ext2

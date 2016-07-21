@@ -1,0 +1,73 @@
+Format na dysku
+----------------
+Inode'y mam połączone w jednokierunkową listę niecykliczną.
+Używam tych dwóch pozostałych 32-bitowych pól zarezerwowanych w Linuksie na odpowiednio:
+* numer inode'a będącego głową listy
+* numer inode'a będącego naszym następnikiem na liście
+
+Oba mogą być zerami (oznacza to np. brak następnika, czyli koniec listy).
+
+Deuplikacja bloków
+----------------
+Bloki deduplikuję przy get_block z create=1, write_begin i writepage.
+Drugie i trzecie są potrzebne, żeby wykryć ewentualne bloki, które
+zostały zamapowane do pagecache przed deduplikacją (z create=0 do get_block)
+-- muszę je zdeduplikować i przepiąć.
+Writepage jest potrzebne z powodu np. mmapa, który nie woła write_begin.
+
+Lockowanie
+----------------
+Uwspólniam truncate_mutex wszystkich inode'ów z listy.
+Aby móc przy iget dostać się do truncate_mutex naszej listy,
+superblok przechowuje drzewo czerwono-czarne mapujące numer korzenia -> mutex.
+Mutex ma oczywiście refcount. Każda operacja na liście
+wymaga wzięcia truncate_muteksa.
+
+Gdy usuwany jest jakiś inode, to:
+* jeśli jest głową swojej listy: zmieniam wszystkim inode'om na liscie
+  głowę na jego następnika, po czym (trzymając w ręce truncate_mutex,
+  więc sama lista nie ulega zmianie) usuwam mutex z rbtree i wstawiam
+  pod nowym kluczem. W czasie tej operacji nikt nie będzie nawet próbował
+  dobierać się do tego muteksa, gdyż wszystkie inode'y używające go
+  już siedzą na liscie.
+* Jeśli nie jest, to po prostu znajduję poprzednik i w klasyczny sposób usuwam
+  element z listy.
+
+Tak jak było mówione na labach -- zakładam, że cała lista cowowanych inode'ów
+miesci się w pamięci. Zatem gdy tego potrzebuję, przechodzę się po niej,
+zwiększając refcounty, a gdy przestanę potrzebować: przechodzę się ponownie,
+zmniejszając refcounty. Ponieważ nasz system i tak nie jest efektywny,
+wyszukanie inode'a pomiędzy wczytaniem listy a jej zwolnieniem dokonuję używając
+iget_locked -- mam gwarancję, że zwróci poprawny inode. Wprawdzie ładniej
+byłoby jakoś cache'ować sobie tę listę, ale to i tak nie jest efektywny COW ;)
+
+Truncate
+---------------
+Ponieważ żeby przechodzić testy, muszę współdzielić bloki pośrednie,
+truncate jest nieco trikowy. Głównym podproblemem jest: przejsć się po
+jakimś poddrzewie bloków i odpiąć współdzielone już bloki od nas, tak żeby
+już istniejące funkcje do truncate nie zdealokowały go. Jednakże należy robić
+to ostrożnie, najpierw sprawdzając, czy blok na 1 warstwie drzewka jest współdzielony,
+a jak nie jest, to dopiero wtedy sprawdzać warstwę 2: inaczej mógłbym ten
+współdzielony blok z warstwy drugiej odpiąć od współdzielonego bloku warstwy 1!
+Jednakże dla uproszczenia mój truncate deduplikuje (jeśli jest to potrzebne)
+ścieżkę do punktu ucięcia truncatem. Koszt jest niewielki (i tak alokacja
+będzie czasem wymagana), a upaszcza kod.
+
+Obsługa DAX i NOBH
+--------------
+Zgodnie z tym, co było mówione na labach -- zabraniam dotykania inode'ów
+podlegających duplikacji bloków w trybach DAX i NOBH. Z takim inode
+nie da się zrobić nic, dopóki administrator nie zamontuje w normalnym trybie ;)
+
+ccp
+--------------
+Moje ccp woła ioctla (upewniając się najpierw, że źródło leży na ext2).
+Napisałem swoje ccp w Haskellu (zatem wymaga jest instalacja kompilatora Haskella,
+wersja ghc z repo obrazu labowego qemu radzi sobie świetnie).
+Ponieważ jednak musiałem tam na sztywno wpisać np. rozmiar struktury statfs
+i offsety wewnątrz niej (wziąłem je z labowego obrazu qemu), załączam też
+bardziej przenośną wersję w C (plik cccp.c). Makefile kompiluje obie.
+
+Tak jak było mówione na labach, dla uproszczenia mój ioctl nie tworzy pliku sam,
+lecz dostaje deskryptor już stworzonego pliku.

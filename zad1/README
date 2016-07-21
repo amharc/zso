@@ -1,0 +1,23 @@
+I zadanie zaliczeniowe z ZSO
+Krzysztof Pszeniczny, 347208
+----------------------------
+
+W moim rozwiązaniu proces raise mapuje w swoją przestrzeń adresową
+fragmenty pliku core oraz plików mapowanych do pamięci przez wznawiany proces.
+
+Ponieważ od momentu, gdy zaczynam modyfikować swoją przestrzeń adresową
+dokonując powyższych mapowań, nie mogę ufać glibc (które będzie się odwoływało
+do sterty, TLS-u (np. errno, cancellation point w niektórych syscallach), vdso
+(wprawdzie na maszynie wirtualnej z labów go nie ma, ale pisałem kod zanim zostało
+to ogłoszone)), zatem ręcznie wołam syscalle używając int 0x80.
+
+Ponadto nie mogę korzystać z alokacji pamięci na stercie, używam własnego bufora
+o wielkości około 0.5 MB, zawartego w sekcji .bss mojego programu. Ponadto używam
+8 kB własnego stosu (także alokowanego w sekcji .bss). Pozostaje jeszcze sprawa notatki
+NT_FILE. Jednakże kernel sam ogranicza jej rozmiar do 4 MB, zatem przyjąłem to jako
+ograniczenie rozmiaru bufora na pojedynczą ścieżkę.
+
+Oprócz rejestrów podanych w treści, przywracam jeszcze rejestr %gs, w celu wymuszenia
+przeładowania deskryptora segmentu TLS.
+
+Nie próbuję dealokować pamięci, którą zajął proces raise.
